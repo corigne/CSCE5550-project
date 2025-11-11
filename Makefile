@@ -32,13 +32,13 @@ siggen:
 # Install Go dependencies for all modules
 install-deps:
 	@echo "Installing dependencies for p1_attack..."
-	@cd p1_attack && go mod download
-	@echo "Installing dependencies for monitor..."
-	@cd p2_monitor_detect_mitigate/monitor && go mod download
+	@cd p1_attack && go mod tidy
+	echo "Installing dependencies for monitor..."
+	@cd p2_monitor_detect_mitigate/monitor && go mod tidy
 	@echo "Installing dependencies for fanotify monitor..."
-	@cd p2_monitor_detect_mitigate/monitor_fanotify && go mod download
+	@cd p2_monitor_detect_mitigate/monitor_fanotify && go mod tidy
 	@echo "Installing dependencies for signature_generator..."
-	@cd p2_monitor_detect_mitigate/signature_generator && go mod download
+	@cd p2_monitor_detect_mitigate/signature_generator && go mod tidy
 	@echo "✓ All dependencies installed"
 
 # Generate signature for attack binary
