@@ -295,7 +295,6 @@ func decryptDirectory(dirPath string, privateKey *rsa.PrivateKey) ([]string, err
 
 // Decrypt a single file
 func decryptSingleFile(encPath string, privateKey *rsa.PrivateKey) error {
-	// Decrypt the file
 	plaintext, err := DecryptFileAsymmetric(encPath, privateKey)
 	if err != nil {
 		return err
