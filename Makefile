@@ -4,7 +4,7 @@
 .PHONY: all clean attack monitor siggen help install-deps signatures
 
 # Default target
-all: attack monitor siggen
+all: attack monitor monitor-fanotify siggen
 
 # Build the attack binary
 attack:
@@ -18,6 +18,11 @@ monitor:
 	@cd p2_monitor_detect_mitigate/monitor && go build -o monitor monitor.go
 	@echo "✓ Monitor built: p2_monitor_detect_mitigate/monitor/monitor"
 
+monitor-fanotify:
+	@echo "Building fanotify based monitor..."
+	@cd p2_monitor_detect_mitigate/monitor_fanotify && go build -o monitor_fanotify monitor_fanotify.go
+	@echo "✓ Built monitor_fanotify"
+
 # Build the signature generator
 siggen:
 	@echo "Building signature generator..."
@@ -30,6 +35,8 @@ install-deps:
 	@cd p1_attack && go mod download
 	@echo "Installing dependencies for monitor..."
 	@cd p2_monitor_detect_mitigate/monitor && go mod download
+	@echo "Installing dependencies for fanotify monitor..."
+	@cd p2_monitor_detect_mitigate/monitor_fanotify && go mod download
 	@echo "Installing dependencies for signature_generator..."
 	@cd p2_monitor_detect_mitigate/signature_generator && go mod download
 	@echo "✓ All dependencies installed"
@@ -59,6 +66,11 @@ run-attack:
 run-monitor: signatures
 	@echo "[AS SUDO] Running monitor with signature detection..."
 	@cd p2_monitor_detect_mitigate/monitor && sudo ./monitor -dir=../../p1_attack/encrypt_me -sigs=../malicious_sigs.txt
+
+# Run the monitor using fanotify with signature detection
+run-monitor-fanotify: signatures
+	@echo "[AS SUDO] Running monitor with signature detection..."
+	@cd p2_monitor_detect_mitigate/monitor_fanotify && sudo ./monitor_fanotify -dir=../../p1_attack/encrypt_me -sigs=../malicious_sigs.txt
 
 # Run the monitor without signature detection (directory monitoring only)
 run-monitor-basic:
