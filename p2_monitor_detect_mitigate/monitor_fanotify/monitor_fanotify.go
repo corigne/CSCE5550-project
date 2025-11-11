@@ -23,12 +23,11 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"syscall"
 	"time"
 	"unsafe"
 
+	"github.com/fsnotify/fsnotify"
 	"golang.org/x/sys/unix"
 )
 
@@ -37,6 +36,8 @@ var (
 	signatureFile string
 	maliciousSigs map[string]bool
 	dryRun        bool
+	accessCh      chan string
+	preventionCh  chan string
 )
 
 const (
@@ -54,6 +55,8 @@ func init() {
 
 func main() {
 	flag.Parse()
+	accessCh = startLogger("./access.log")
+	preventionCh = startLogger("./prevention.log")
 
 	log.Printf("Starting fanotify-based directory protection monitor...")
 	absPath, err := filepath.Abs(targetDir)
@@ -77,13 +80,18 @@ func main() {
 	}
 
 	// Start fanotify monitor (blocks open events and responds allow/deny)
+	// This is part of the unix OS system call set
+	// It is a tool for moderating filesystem accesses.
+	// I'm using it here to identify malicious executables being loaded
+	// and executed via the exec syscall.
+	go watchDir(targetDir, accessCh)
 	if err := runFanotifyMonitor(targetDir); err != nil {
 		log.Fatalf("fanotify monitor failed: %v", err)
 	}
 }
 
 //
-// Signature helpers (unchanged except for packaging)
+// Signature helpers
 //
 
 func loadSignatures(filename string) {
@@ -116,16 +124,6 @@ func calculateFileHashFromFile(f *os.File) (string, error) {
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
-func calculateFileHash(path string) (string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-
-	return calculateFileHashFromFile(file)
-}
-
 //
 // Process helpers (mostly preserved from your original monitor)
 //
@@ -134,75 +132,6 @@ type ProcessInfo struct {
 	PID        int
 	Name       string
 	Executable string
-}
-
-func isAuthorizedProcess(procInfo ProcessInfo) bool {
-	// Expand this list if your distribution stores system daemons elsewhere.
-	authorizedPaths := []string{
-		"/bin/",
-		"/sbin/",
-		"/usr/bin/",
-		"/usr/sbin/",
-		"/lib/systemd/",
-		"/usr/lib/systemd/",
-		"/lib/",
-		"/usr/lib/",
-		"/snap/",
-	}
-
-	execPath := filepath.Clean(procInfo.Executable)
-	for _, authPath := range authorizedPaths {
-		if strings.HasPrefix(execPath, filepath.Clean(authPath)) {
-			return true
-		}
-	}
-
-	// Process-name based allow list for core system daemons that may not live in standard dirs
-	safeNames := map[string]bool{
-		"systemd":          true,
-		"systemd-journald": true,
-		"dbus-daemon":      true,
-		"sshd":             true,
-		"cron":             true,
-		"rsyslogd":         true,
-		"udevd":            true,
-		"polkitd":          true,
-		"dconf-service":    true,
-	}
-	if safeNames[procInfo.Name] {
-		return true
-	}
-
-	return false
-}
-
-func getProcessInfo(pid int) (*ProcessInfo, error) {
-	exePath, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
-	if err != nil {
-		return nil, err
-	}
-	commData, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
-	if err != nil {
-		return nil, err
-	}
-	return &ProcessInfo{
-		PID:        pid,
-		Name:       strings.TrimSpace(string(commData)),
-		Executable: exePath,
-	}, nil
-}
-
-func killProcess(pid int, procName string) error {
-	log.Printf("ALERT: Killing unauthorized process %s (PID: %d)", procName, pid)
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return err
-	}
-	// Try SIGTERM first
-	if err := process.Signal(syscall.SIGTERM); err != nil {
-		return process.Kill()
-	}
-	return nil
 }
 
 //
@@ -288,25 +217,49 @@ func runFanotifyMonitor(target string) error {
 			reason = "malicious file hash"
 		}
 
-		// Log decision
-		if !allow {
-			log.Printf("DENY pid=%d: %s", pid, reason)
-			killProcess(pid, strconv.Itoa(pid))
-		}
-
 		// Respond to kernel
 		resp := unix.FanotifyResponse{
 			Fd:       int32(fileFd),
 			Response: FAN_ALLOW,
 		}
+
+		// Take Action and Log decision
 		if !allow {
 			resp.Response = FAN_DENY
+			log.Printf("DENY pid=%d: %s", pid, reason)
+			// this will result in the process failing to execute
+			// as the executable can't be loaded at the fs level
+			// so we don't even need to kill the process
 		}
 
 		respBuf := new(bytes.Buffer)
 		binary.Write(respBuf, binary.LittleEndian, resp)
-		if _, err := unix.Write(fd, respBuf.Bytes()); err != nil {
-			log.Printf("fanotify response write failed: %v", err)
-		}
+		unix.Write(fd, respBuf.Bytes())
 	}
+}
+
+func watchDir(path string, ch chan string) {
+	watcher, _ := fsnotify.NewWatcher()
+	defer watcher.Close()
+	watcher.Add(path)
+	for event := range watcher.Events {
+		ch <- fmt.Sprintf("fsnotify event: %s %s", event.Op, event.Name)
+	}
+}
+
+func startLogger(path string) chan string {
+	ch := make(chan string, 1024)
+	go func() {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			log.Fatalf("failed to open log file: %v", err)
+		}
+		defer f.Close()
+		for msg := range ch {
+			timestamp := time.Now().Format(time.RFC3339)
+			f.WriteString(fmt.Sprintf("%s %s\n", timestamp, msg))
+			log.Print(msg) // also print to stdout
+		}
+	}()
+	return ch
 }
