@@ -286,20 +286,10 @@ func runFanotifyMonitor(target string) error {
 		if err == nil && len(maliciousSigs) > 0 && maliciousSigs[hash] {
 			allow = false
 			reason = "malicious file hash"
-		} /*else {
-			procInfo, err := getProcessInfo(pid)
-			if err != nil {
-				reason = "cannot inspect process"
-			} else if !isAuthorizedProcess(*procInfo) {
-				allow = false
-				reason = fmt.Sprintf("unauthorized process %s", procInfo.Executable)
-			}
-		} */
+		}
 
 		// Log decision
-		if allow {
-			log.Printf("ALLOW pid=%d: %s", pid, reason)
-		} else {
+		if !allow {
 			log.Printf("DENY pid=%d: %s", pid, reason)
 			killProcess(pid, strconv.Itoa(pid))
 		}
