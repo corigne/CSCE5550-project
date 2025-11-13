@@ -13,6 +13,7 @@ attack:
 	@echo "✓ Attack binary built: p1_attack/attack"
 
 # Build the monitor
+# Deprecated...
 monitor:
 	@echo "Building monitor..."
 	@cd p2_monitor_detect_mitigate/monitor && go build -o monitor monitor.go
@@ -91,32 +92,15 @@ setup:
 # Build everything and generate signatures
 build-all: install-deps all signatures
 	@echo ""
-	@echo "═══════════════════════════════════════════"
 	@echo "Build Summary:"
-	@echo "═══════════════════════════════════════════"
 	@ls -lh p1_attack/attack 2>/dev/null && echo "✓ Attack binary ready" || echo "✗ Attack binary missing"
 	@ls -lh p2_monitor_detect_mitigate/monitor/monitor 2>/dev/null && echo "✓ Monitor ready" || echo "✗ Monitor missing"
 	@ls -lh p2_monitor_detect_mitigate/signature_generator/sig_gen 2>/dev/null && echo "✓ Signature generator ready" || echo "✗ Signature generator missing"
 	@ls -lh p2_monitor_detect_mitigate/malicious_sigs.txt 2>/dev/null && echo "✓ Signatures file ready" || echo "✗ Signatures file missing"
-	@echo "═══════════════════════════════════════════"
 	@echo ""
 	@echo "Quick Start:"
-	@echo "  Terminal 1: sudo make run-monitor"
+	@echo "  Terminal 1: make run-monitor-fanotify"
 	@echo "  Terminal 2: make run-attack"
-	@echo ""
-
-# Test the full workflow
-test: build-all setup
-	@echo ""
-	@echo "═══════════════════════════════════════════"
-	@echo "Test Setup Complete!"
-	@echo "═══════════════════════════════════════════"
-	@echo ""
-	@echo "To test the defense system:"
-	@echo "  1. In Terminal 1, run: sudo make run-monitor"
-	@echo "  2. In Terminal 2, run: make run-attack"
-	@echo ""
-	@echo "The monitor should detect and kill the attack process."
 	@echo ""
 
 # Help target

