@@ -7,8 +7,7 @@
 // Notes:
 // - Must run as root.
 // - Requires linux kernel with fanotify support (modern kernels do).
-// - This program will deny opens it deems unauthorized/malicious.
-// - Use with caution: denying legitimate opens can break other software. Logging is verbose to help tuning.
+// - This program will deny opens it deems unauthorized/malicious, using signatures
 
 package main
 
@@ -143,7 +142,7 @@ type ProcessInfo struct {
 func runFanotifyMonitor(target string) error {
 	var fanFlags uint
 	var eventFlags uint
-	// 1) Initialize fanotify
+	// Initialize fanotify
 	// Use PRE_CONTENT class so we can get permission events and deny before open completes
 	fanFlags = unix.FAN_CLASS_PRE_CONTENT | unix.FAN_CLOEXEC | unix.FAN_NONBLOCK
 	// event_f_flags: we want file descriptors for open files
@@ -156,7 +155,7 @@ func runFanotifyMonitor(target string) error {
 	// Ensure we close on exit
 	defer unix.Close(fd)
 
-	// 2) Mark the target mount or directory.
+	// Mark the target mount or directory.
 	// Mark the mount (so all children under same mount are covered). Use EVENT_ON_CHILD to get events for files under directory.
 	var markFlags uint
 	markFlags = unix.FAN_MARK_ADD | unix.FAN_MARK_MOUNT
